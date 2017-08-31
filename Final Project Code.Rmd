@@ -1,0 +1,258 @@
+---
+title: "PSTAT 226 Final Project: Bike Sharing"
+author: "Ben Vaughan"
+date: "3/5/2017"
+output: pdf_document
+---
+#Introduction
+
+For this project I decided to look at data of bike sharing from the UCI Machine Learning Repository. The main feature of the data is counts of total rental bikes including casual and registered bikes from Capital Bikeshare system in Washington D.C. for each day spanning a total two years. I thought this data might be interesting to look at given the popularity of bike riding at UCSB.
+
+I started this project with the intent of finding a strong seasonal pattern in bike rentals that might help companies in the bicycling industry focus their advertising. I did so by first fitting both a Fourier series and a smoothing spline model. However, models that minimized cross validation scores and prediction errors seemed to overfit, which I believe could be the result of autocorrelation in the data. To adjust for overfitting, I manually changed the smoothing parameters for both models. The Fourier fit showed a good general pattern, however, the fit seemed very dependent on the bandwidth. This instability was somewhat concerning. The smoothing spline fit showed a good general pattern and also a few waves, which I thought was a good sign of the model attempting to account for the variability in the data. To combine both the smooth general pattern with something that accounted for variability, I ended up fitting a local linear model with simultaneous confidence bands. The local linear fit that used generalized cross validation to determine the best smoothing parameter seemed to overfit the data, so I again manually adjusted the parameter and ended up with a model that showed both a good general pattern and also showed that the apparent variability in the data may not be as detrimental a phenomenon to business as it may seem by just looking at the data.
+
+#Analysis
+
+##The Data
+As I mentioned, I was looking at bike rental data. To get a general sense of what the data looks like, it is simple to create a scatterplot.
+```{r, echo=FALSE}
+#import data
+bikes <- read.csv("C:/Users/Ben/Dropbox/PSTAT 226/Final Project/Bike-Sharing-Dataset/day.csv",
+                  header=T)
+attach(bikes)
+```
+
+```{r}
+#plot the data
+plot(x=dteday,y=cnt, xlab="Date",ylab="Number of Rentals")
+lines(dteday,cnt)
+plot(x=dteday,y=cnt, xlab="Date",ylab="Number of Rentals")
+```
+
+From these plots, we can in fact see two general mounds during the summer months of both years that the data was collected over, as one would expect; however, we can also perhaps see some small dips in the centers of those mounds. Dips in business during summer months might be detrimental to some bike sharing businesses, so being able to tell if these are significant would be very important. Whether these dips are in fact significant might be easier to tell with a model. However, before doing that, we might also want to note that there is some large variation in the data. Seeing as there is only one observation on each day, one might not expect this amount of variation; I certainly did not. This variation might be the result of strange weather patterns or something else, but it does ultimately make finding a "good" model a bit more difficult.
+
+I few other features about this data that may be of some importance are the minimum, `r min(cnt)`, and maximum, `r max(cnt)`, of the number of bikes rented in this dataset. This minimum is an obvious outlier and corresponds to 10/30/2012. This was in fact a week day and a work day for the company, so business was either horrible that day or there was a data entry error. Either way, I believe it would be best to remove that datapoint from the analysis seeing as it doesn't provide very usefull information for fitting a nonparametric model. Also, the data appear to be somewhat non-normal due to a generally higher density of observations in the upper part of the curve; this is likely to be expected because this is count data, which typically fail to be modeled using normality. Lastly, counts also appear to fan out as time goes on, so there is quite a bit more variability in the counts at the end of 2012 than there was at the beginning of 2011. This last part will become important to the $log$ transformation to the counts in order to try and control this fanning.
+
+```{r, echo=FALSE}
+cnt2 <- bikes$cnt[-668]
+cnt <- log(cnt2)
+
+instant <- bikes$instant[-668]
+dteday <- bikes$dteday[-668]
+
+plot(x=dteday,y=cnt, xlab="Date",ylab="ln(Number of Rentals)")
+```
+
+From the plot above, we can now see that the spread of the counts is relatively uniform from the beginning of 2011 to the end of 2012, which is more ideal, so I will use the transformed data for the remainder of the analysis.
+
+##Fourier Series Model
+
+So I first tried a Fourier Series model to try and see how much of the waviness in the data might be accounted for by a function that is composed of sines and cosines. For this Fourier model, I tried to find the bandwidth that minimized the prediction error. The plot below shows the bandwidth versus prediction error.
+
+```{r}
+##### Fitting a Fourier Model #####
+
+#coefficient estimates
+spec <- fft(cnt)
+
+#variance estimate
+#estimated using noise terms
+n <- length(cnt)
+sighat <- sqrt(mean(Mod(spec[100:366])^2)/n)
+
+#compute prediction errors for models with all possible bandwidths to find best bandwidth 
+#best bandwidth = smallest prediction error
+Ph <- vector()
+
+#loop through all possible bandwidths, creating vector of prediction errors for each
+for(h in 1:((n/2)-1)){
+  fltrd <- c(spec[1:(h+1)],
+             rep(0,n-((2*h)+1)),
+             spec[seq((n+1)-h,n)])
+  phat <- Re(fft(fltrd,inverse=TRUE)/n)
+  Ph[h] <- mean((phat-cnt)^2 + 2*(sighat^2)*(2*h)/n)
+}
+
+#plot bandwidths versus prediction errors
+plot(1:300,Ph[1:300],type='h',xlab="Bandwidth", ylab="Prediction Error")
+
+#the minimal prediction error bandwidth
+h <- which(Ph == min(Ph))
+```
+
+The bandwidth that ends up giving us the smallest prediction error is `r h`. If we plot the fit using this bandwidth against the original data, we get the following graph.
+
+```{r}
+#get the coefficients corresponding to the minimal prediction error bandwidth
+fltrd <- c(spec[1:(h+1)],
+           rep(0,n-((2*h)+1)),
+           spec[seq((n+1)-h,n)])
+
+#transform coefficients into something plottable
+phat <- Re(fft(fltrd,inverse=TRUE)/n)
+
+#plot the minimal prediction error fourier fit
+plot(x=dteday,y=cnt,xlab="Date",ylab="ln(Number of Rentals)")
+lines(instant,phat,col='blue',lwd=2)
+```
+
+This is not a very good result if we were trying to find a more general pattern. The waviness in this model likely means we are violating an assumption made by Fourier Series models. A common violation is having autocorrelated data. It is unclear from the data description, but it was my original belief that these counts were independent of each other. I thought that on each day bikes would be rented and returned the same day; however, if this were not the case, where bikes could be rented for multiple days at a time, then there would be obvious correlation in the data. However, because it is not clear from the data description, I decided to continue with the analysis with the assumption of non-correlated data in the back of my mind. I then tried to minimize, instead of the prediction error, the cross validation score; this gave me a slightly different result.
+
+```{r}
+#using cross validation to find best bandwidth
+cvh <- vector()
+
+#loop through all possible bandwidths, creating vector of cv scores for each 
+for(h in 1:((n/2)-1)){
+  cvh[h] <- sum(Mod(spec[seq(h+2,(n+1)/2)])^2)/(n-(2*h+1))^2
+}
+
+#the minimal cv score bandwidth
+fourier.h.cv <- which(cvh==min(cvh))
+
+#get the coefficients corresponding to the minimal prediction error bandwidth
+fltrd.fourier.cv <- c(spec[1:(fourier.h.cv+1)],
+           rep(0,n-((2*fourier.h.cv)+1)),
+           spec[seq((n+1)-fourier.h.cv,n)])
+
+#transform coefficients into something plottable
+phat <- Re(fft(fltrd.fourier.cv,inverse=TRUE)/n)
+
+#plot the minimal cv score fourier fit
+plot(x=dteday,y=cnt,xlab="Date",ylab="ln(Number of Rentals)")
+lines(instant,phat,col='blue',lwd=2)
+```
+
+The model above was fit with the optimal bandwidth of `r fourier.h.cv`. This model seems a bit better than the one with the larger bandwidth, however, it still appears to be overfitting the data
+Since we still appear to be overfitting, I tried manually adjusting the bandwidth to get a smoother mean function estimate.
+
+```{r}
+h.manual <- 7
+
+#get the coefficients corresponding to the minimal prediction error bandwidth
+fltrd2 <- c(spec[1:(h.manual+1)],
+           rep(0,n-((2*h.manual)+1)),
+           spec[seq((n+1)-h.manual,n)])
+
+#transform coefficients into something plottable
+phat2 <- Re(fft(fltrd2,inverse=TRUE)/n)
+
+#plot the minimal prediction error fourier fit
+plot(x=dteday,y=cnt,xlab="Date",ylab="Number of Rentals")
+lines(instant,phat2,col='blue',lwd=2)
+```
+
+A bandwidth of `r h.manual` seems to give a relatively good fit to the data, however, the bandwidth is quite sensitive. Adjusting it very slightly appeared to add a significant amount of waving in the summer months. This was somewhat concerning, seeing as at this point it was unclear to tell if this smoother model or one with more waves was better. I wanted to somehow control the waviness of the model in a more stable way.
+
+##Smoothing Spline Model
+
+After the Fourier model, I fit a spline model, which uses a penalty term. I thought this might be a better bet at fitting a smoother model since the penalty term tries to control for the roughness of the mean function estimate. I plot the penalty term versus the cross validation score below. 
+
+```{r}
+##### Fitting a Spline Model #####
+
+#cross validation to find best smoothing parameter
+
+#a vector of many "decent" penalty terms
+lambda <- seq(0,1,length=1000)
+cvh.spline <- vector()
+
+#loop through many "decent" penalty terms, creating vector of cv scores for each
+for(i in 1:1000)
+{
+  splinefit <- smooth.spline(x=instant, y=cnt, all.knots=TRUE, spar=lambda[i])
+  cvh.spline[i] <- splinefit$cv.crit
+}
+
+#plot the penalty terms versus the cv score
+plot(lambda,cvh.spline,type='h', xlab="Penalty Term", ylab="Cross Validation Score")
+
+#the minimal cv score penalty term
+lambda.small <- which(cvh.spline == min(cvh.spline))*(1/1000)
+```
+
+The optimal penalty term for this model is `r lambda.small`. A spline model using this penalty term gave me the following fit.
+
+```{r}
+#use smooth.spline function to plot the spline model with the minimal cv score penalty term 
+splinefit <- smooth.spline(x=instant, y=cnt, all.knots = TRUE, spar=lambda.small)
+
+#plot the spline estimator transposed on the data and the fourier fit
+plot(dteday,cnt,xlab="Date",ylab="ln(Number of Rentals)")
+lines(instant,phat,col="blue",lwd=2)
+lines(predict(splinefit),lwd=2, col="red")
+```
+
+Here, the blue line is from the previous Fourier fit with the optimal cv score bandwidth and the red line is from the spline fit. We can see that the spline fit appears to be overfitting. Again, this may be due to the time-series violation. However, I again attempt to manually adjust the penalty term to get a seemingly better fit.
+
+```{r}
+lambda.manual <- 1
+
+#use smooth.spline function to plot the spline model with the minimal cv score penalty term 
+splinefit2 <- smooth.spline(x=instant, y=cnt, all.knots = TRUE, spar=lambda.manual)
+
+#plot the spline estimator transposed on the data and the fourier fit
+plot(dteday,cnt,xlab="Date",ylab="ln(Number of Rentals)")
+lines(predict(splinefit2),lwd=2, col="red")
+```
+
+At a rather maximal penalty term of `r lambda.manual`, we actually get a very interesting fit that doesn't change extremely with small decreases to the term. We see the typical dips and rises along with several smaller waves in the summer months. This is interesting, because we see that the model is trying to account for large variability in the summer that we saw in the original plot of the data, but also shows a general trend over each year.
+
+##Project Extension (Simultaneous Confidence Bands)
+
+From here, I wanted to find a way to get a smoother model, but also not lose too much information provided by the variation in the data. This led me to attempt fitting a local linear estimator with confidence bands. Here, I use the R package `locfit` to fit a local linear model. The local linear fit includes a smoothing parameter, so I loop through many possible smoothing parameters to find the one that gives the smallest generalized cross validation score.
+
+```{r}
+library(locfit)
+
+#cross validation
+alphas <- seq(0.01,1,by=0.01)
+cvh.ll <- vector()
+for(i in 1:length(alphas)){
+  cvh.ll[i] <- getElement(gcv(cnt~instant,alpha=alphas[i]),"gcv")
+}
+h.ll <- alphas[which(cvh.ll == min(cvh.ll))]
+```
+
+The smoothing paramter that returned the smallest gcv score was `r h.ll`. I then use this parameter to fit the local linear model below. Because the large variability in the data makes a mean function somewhat unhelpful, I also calculate and plot simultaneous confidence bands for the mean function.
+
+```{r}
+#create a local linear fit
+loclinfit <- locfit(cnt~instant,alpha=h.ll)
+
+#95% simultaneous bands
+crit(loclinfit) <- kappa0(cnt~instant,data=bikes,cov=0.95)
+plot(loclinfit,band="local",col="purple",xlab="Date",ylab="ln(Number of Rentals)")
+lines(x=dteday,y=cnt,type="p",lwd=0.3)
+```
+
+Again, we run into the problem of the model overfitting, however, it seems a bit easier to make out a more general pattern in the plot and the confidence bands give us a good idea of when bike rentals are at their most turbulent. This model is, of course, still not extremely useful, so I tried a few other smoothing parameters. The one that seemed to give me the clearest pattern was used to create the plot below.
+
+```{r}
+loclinfit2 <- locfit(cnt~instant,alpha=0.2)
+
+crit(loclinfit2) <- kappa0(cnt~instant,data=bikes,cov=0.95)
+plot(loclinfit2,band="local",col="purple",xlab="Date",ylab="ln(Number of Rentals)")
+lines(x=dteday,y=cnt,type="p",lwd=0.3)
+```
+
+From this fit with a smoothing parameter of 0.2, we can still see clear dips during the winter months and rises in the summer months. Our confidence bands here also show us that the data might not be as spread as it may seem at first, seeing as the bands are relatively close together compared to the seemingly large spread of the data. This tells us that there is indeed a drop in bike rentals during the winter and although summer days may see turbulance in rentals, the numbers are actually quite predictable and the number of rentals is quite dependable in the summer.
+
+#Conclusion
+
+It appears that, even though they minimize prediction error and cross validation scores, the original Fourier and spline models overfit the data, which is likely due to a violation of nonparametric regression assumptions, namely a time-series correlation in the data. Manually adjusting the bandwidth in the Fourier fit created a better looking model, but one that seemed quite sensitive to this bandwidth. Manually adjusting the penalty term in the spline fit created a model that seemed to try to be accounting for the large variability visible in the summer months and also created a nice general pattern, which were promising results. In trying to get a sort of combination of a stable, smooth model, but also one that accounted for the variability in the data, I fit a local linear model with simultaneous confidence bands. The original local linear fit that used generalized cross validation to determine an appropriate smoothing parameter ran into the same problem of overfitting that the other models did, so I again adjusted the smoothing parameter manually. Small changes in this parameter also did not vastly change the estimate, so I felt confident in doing this manual adjustment. The fit I ended up with was one that came out quite similar to the other smoother models. The simultaneous confidence bands also ended up showing that there in fact wasn't a terrible amount of variation in the number of rentals during the summer months, so rental numbers were actually a bit more dependable than they might seem based on simply looking at the data. I'm quite happy with this local linear fit and its confidence bands as it shows a good general pattern and shows that bike rentals are actually relatively predictable during all times of the year; however it would definitely be helpful to try an account for autocorrelation in the data. It may help bike rental businesses to know this, especially smaller businesses. If rentals seem relatively slow during summer, this data and analysis show that rentals will most likely dependably rise again.
+
+#References
+
+Lichman, M. (2013). UCI Machine Learning Repository [http://archive.ics.uci.edu/ml]. Irvine, CA: University of California, School of Information and Computer Science.
+
+Bike rental data from the UCI Machine Learning Repository can be found at the following link:
+
+[https://archive.ics.uci.edu/ml/datasets/Bike+Sharing+Dataset](https://archive.ics.uci.edu/ml/datasets/Bike+Sharing+Dataset)
+
+Catherine Loader (2013).
+  locfit: Local
+  Regression, Likelihood
+  and Density Estimation..
+  R package version
+  1.5-9.1.
+  [https://CRAN.R-project.org/package=locfit](https://CRAN.R-project.org/package=locfit)
